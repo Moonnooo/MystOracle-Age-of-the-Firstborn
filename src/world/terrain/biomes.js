@@ -14,6 +14,7 @@ export const BIOMES = {
 };
 
 const moistureNoise = createWorldNoise(12345);
+const swampRegionNoise = createWorldNoise(54321);
 
 function clamp01(v) {
     if (v < 0) return 0;
@@ -32,6 +33,7 @@ export const SEA_LEVEL = 18;
 export function getBiomeInfoAt(wx, wz, baseHeight) {
     const moistNoiseVal = moistureNoise.noise2D(wx * 0.001 + 1000, wz * 0.001 + 1000);
     const moisture = clamp01(0.5 + 0.5 * moistNoiseVal);
+    const layered = getBiomeWorld(wx, wz);
 
     if (baseHeight <= SEA_LEVEL - 2) {
         return {
@@ -59,17 +61,23 @@ export function getBiomeInfoAt(wx, wz, baseHeight) {
         };
     }
 
-    if (moisture > 0.72 && baseHeight < SEA_LEVEL + 3) {
+    // Swamp should form as broad lowland regions, not tiny speckles in plains.
+    const swampMask = clamp01(0.5 + 0.5 * swampRegionNoise.noise2D(wx * 0.00045 - 500, wz * 0.00045 + 700));
+    if (
+        layered === 'plains' &&
+        moisture > 0.76 &&
+        swampMask > 0.58 &&
+        baseHeight < SEA_LEVEL + 2
+    ) {
         return {
             biome: BIOMES.SWAMP,
             temperature: 0.55,
             moisture,
             desertBlend: 0,
-            layeredBiome: getBiomeWorld(wx, wz),
+            layeredBiome: layered,
         };
     }
 
-    const layered = getBiomeWorld(wx, wz);
     let biome = BIOMES.PLAINS;
     if (layered === 'forest') biome = BIOMES.FOREST;
     else if (layered === 'mountains') biome = BIOMES.MOUNTAINS;

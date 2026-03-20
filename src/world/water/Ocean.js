@@ -26,7 +26,8 @@ export function applyOceansToChunk(voxels, cx, cz, helpers) {
                 topSolid === BLOCK_IDS.SNOW;
 
             const yStart = Math.max(0, surfaceY);
-            const yEnd = Math.min(height - 1, SEA_LEVEL);
+            // SEA_LEVEL is the target surface plane, so the top water voxel is SEA_LEVEL - 1.
+            const yEnd = Math.min(height - 1, SEA_LEVEL - 1);
             for (let y = yStart; y <= yEnd; y++) {
                 const cur = voxels[x][y][z];
                 const isW = cur >= BLOCK_IDS.WATER_LEVEL_0 && cur <= BLOCK_IDS.WATER_LEVEL_6;

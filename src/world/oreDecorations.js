@@ -11,9 +11,6 @@ export function createOreDecorationsSystem(scene, terrain, oreModel = null) {
 
     const oreBlockIds = new Set([BLOCK_IDS.COAL_ORE, BLOCK_IDS.IRON_ORE, BLOCK_IDS.GOLD_ORE]);
 
-    if (typeof window !== 'undefined' && window.DEBUG_ORE_DECORATIONS) {
-        if (!oreModel) console.warn('[OreDecorations] oreModel is null; no instanced decorations will be created.');
-    }
 
     // chunkKey -> InstancedMesh
     const instancedByChunk = new Map();
@@ -115,12 +112,6 @@ export function createOreDecorationsSystem(scene, terrain, oreModel = null) {
     }
 
     const ok = initBaseFromModel();
-    if (typeof window !== 'undefined' && window.DEBUG_ORE_DECORATIONS && oreModel && !ok) {
-        console.warn('[OreDecorations] Failed to extract instancing geometry/material from ore model.');
-    }
-    if (typeof window !== 'undefined' && window.DEBUG_ORE_DECORATIONS && ok) {
-        console.log(`[OreDecorations] bakedMeshes=${bakedMeshes.length} bboxMin=(${bboxMinX.toFixed(2)},${bboxMinY.toFixed(2)},${bboxMinZ.toFixed(2)}) instanceScale=${instanceScale.toFixed(3)}`);
-    }
 
     function disposeInstancedMesh(mesh) {
         if (!mesh) return;
@@ -167,10 +158,6 @@ export function createOreDecorationsSystem(scene, terrain, oreModel = null) {
         }
 
         if (exposedPositions.length === 0) return;
-
-        if (typeof window !== 'undefined' && window.DEBUG_ORE_DECORATIONS) {
-            console.log(`[OreDecorations] chunk ${cx},${cz} instances=${exposedPositions.length}`);
-        }
 
         // Create one chunk instanced mesh per baked sub-mesh.
         const instancedMeshes = bakedMeshes.map(({ geometry, material }) => {

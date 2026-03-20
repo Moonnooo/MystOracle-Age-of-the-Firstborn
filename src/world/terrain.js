@@ -2,7 +2,7 @@
 
 import * as THREE from 'three';
 import { ASSET_BASE } from '../assets/assetBase.js';
-import { BLOCK_IDS, isWater } from './blocksRegistry.js';
+import { BLOCK_IDS, isWater, waterLevel } from './blocksRegistry.js';
 import { computeBaseHeight, worldHeightNoise } from './terrain/baseHeight.js';
 import { getBiomeInfoAt, BIOMES, SEA_LEVEL } from './terrain/biomes.js';
 import { LAYERED_SURFACE_THRESHOLDS } from './terrain/layeredTerrainGen.js';
@@ -128,6 +128,40 @@ let _notifyAtlasReady = null;
 buildTerrainAtlas();
 
 export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32, mobSystem = null) {
+    let waterPlacementHandler = null;
+    let currentLeafTint = [0.2, 0.55, 0.2];
+    let currentLeafSeason = 'spring';
+
+    function getLeafTintForSeason(seasonName) {
+        const s = String(seasonName || '').toLowerCase();
+        if (s === 'summer') return [0.18, 0.62, 0.2];
+        if (s === 'autumn') return [0.72, 0.44, 0.14];
+        if (s === 'winter') return [0.58, 0.62, 0.56];
+        return [0.2, 0.55, 0.2]; // spring/default
+    }
+
+    function remeshLoadedChunks() {
+        for (const [key, oldMesh] of chunks.entries()) {
+            const voxels = voxelData.get(key);
+            if (!voxels) continue;
+            const [cx, cz] = key.split(',').map(Number);
+            scene.remove(oldMesh);
+            disposeChunkMesh(oldMesh);
+            const newMesh = createChunkMesh(voxels, cx, cz);
+            scene.add(newMesh);
+            chunks.set(key, newMesh);
+        }
+    }
+
+    function setLeafSeason(seasonName) {
+        const next = String(seasonName || 'spring').toLowerCase();
+        if (next === currentLeafSeason) return false;
+        currentLeafSeason = next;
+        currentLeafTint = getLeafTintForSeason(next);
+        remeshLoadedChunks();
+        return true;
+    }
+
     // Returns the highest solid voxel Y at world X/Z
     function getSurfaceYAt(worldX, worldZ) {
         const vx = Math.floor(worldX);
@@ -222,7 +256,8 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         // Ocean columns: seabed then water from surface up to SEA_LEVEL (same constant as biomes + water modules).
         if (biome === BIOMES.OCEAN) {
             if (y > baseHeight) {
-                if (y <= SEA_LEVEL) return BLOCK_IDS.WATER_LEVEL_0;
+                // Keep top water voxel at SEA_LEVEL - 1 so visible surface is flush at SEA_LEVEL.
+                if (y <= SEA_LEVEL - 1) return BLOCK_IDS.WATER_LEVEL_0;
                 return BLOCK_IDS.AIR;
             }
         }
@@ -314,6 +349,11 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         const mesh = createChunkMesh(voxels, cx, cz);
         scene.add(mesh);
         chunks.set(key, mesh);
+        // Fix stale border faces: neighbors may have been meshed before this chunk existed.
+        rebuildChunkMesh(cx - 1, cz);
+        rebuildChunkMesh(cx + 1, cz);
+        rebuildChunkMesh(cx, cz - 1);
+        rebuildChunkMesh(cx, cz + 1);
 
         // Notify mob system if present
         if (mobSystem && typeof mobSystem.onChunkLoad === 'function') {
@@ -329,8 +369,26 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         transparent: false,
     });
 
-    // Textured but lightweight water. Keep depthWrite to reduce overdraw artifacts.
-    const sharedWaterMaterial = new THREE.MeshBasicMaterial({
+    // Water top material: dedicated repeating texture so greedy-meshed quads do not stretch UVs.
+    const waterTileTexture = new THREE.TextureLoader().load(
+        ASSET_BASE + encodeURI('textures/water_still.png')
+    );
+    waterTileTexture.wrapS = THREE.RepeatWrapping;
+    waterTileTexture.wrapT = THREE.RepeatWrapping;
+    waterTileTexture.magFilter = THREE.NearestFilter;
+    waterTileTexture.minFilter = THREE.NearestFilter;
+
+    const sharedWaterTopMaterial = new THREE.MeshBasicMaterial({
+        vertexColors: false,
+        map: waterTileTexture,
+        transparent: true,
+        opacity: 0.78,
+        depthWrite: true,
+        toneMapped: true,
+    });
+
+    // Water side material: stays on atlas for side faces.
+    const sharedWaterSideMaterial = new THREE.MeshBasicMaterial({
         vertexColors: false,
         map: terrainAtlasTexture || null,
         transparent: true,
@@ -365,8 +423,36 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         // Mob/chest/campfire/particles are notified by the wrapper in renderer.js
     }
 
+    function rebuildChunkMesh(cx, cz) {
+        const key = getChunkKey(cx, cz);
+        const voxels = voxelData.get(key);
+        if (!voxels || !chunks.has(key)) return;
+        const oldMesh = chunks.get(key);
+        if (oldMesh) {
+            scene.remove(oldMesh);
+            disposeChunkMesh(oldMesh);
+        }
+        const newMesh = createChunkMesh(voxels, cx, cz);
+        scene.add(newMesh);
+        chunks.set(key, newMesh);
+    }
+
+    function rebuildNeighborChunksIfBoundary(lx, lz, cx, cz) {
+        if (lx === 0) rebuildChunkMesh(cx - 1, cz);
+        else if (lx === chunkSize - 1) rebuildChunkMesh(cx + 1, cz);
+        if (lz === 0) rebuildChunkMesh(cx, cz - 1);
+        else if (lz === chunkSize - 1) rebuildChunkMesh(cx, cz + 1);
+    }
+
     // 🔥 Face-culling mesh generator
     function createChunkMesh(voxels, cx, cz) {
+        const MAX_WATER_LEVEL = BLOCK_IDS.WATER_LEVEL_6 - BLOCK_IDS.WATER_LEVEL_0;
+        function waterFillRatio(type) {
+            const lvl = waterLevel(type);
+            if (lvl == null) return 1;
+            // level 0 = full block, level 6 = thinnest sheet.
+            return (MAX_WATER_LEVEL + 1 - lvl) / (MAX_WATER_LEVEL + 1);
+        }
         // dir: 0=right,1=left,2=top,3=bottom,4=front,5=back
         function getAtlasTile(type, dir) {
             if (isWater(type)) return ATLAS.WATER;
@@ -451,7 +537,7 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
             if (type === BLOCK_IDS.DIRT)   color = [0.55, 0.27, 0.07];
             if (type === BLOCK_IDS.GRASS)  color = [0.2, 0.8, 0.2];
             if (type === BLOCK_IDS.PLANKS) color = [0.7, 0.55, 0.35];
-            if (type === BLOCK_IDS.LEAVES) color = [0.2, 0.55, 0.2];
+            if (type === BLOCK_IDS.LEAVES) color = currentLeafTint;
             if (type === BLOCK_IDS.SAND)   color = [0.95, 0.9, 0.4];
             if (type === BLOCK_IDS.CACTUS) color = [0.25, 0.8, 0.25];
             if (type === BLOCK_IDS.SNOW) color = [0.92, 0.95, 1.0];
@@ -465,7 +551,8 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
                 // apply a tint so they stand out.
                 let finalColor;
                 if (useTexture) {
-                    finalColor = [1, 1, 1];
+                    // Keep texture detail, but allow seasonal tinting for leaves.
+                    finalColor = (type === BLOCK_IDS.LEAVES) ? color : [1, 1, 1];
                 } else {
                     finalColor = color;
                 }
@@ -501,15 +588,16 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
             });
         }
 
-        function addWaterTopQuad(positions, colors, uvs, x0, x1, z0, z1, y) {
-            const tile = ATLAS.WATER;
-            const u0 = tile * ATLAS_TILE_U;
-            const u1 = u0 + ATLAS_TILE_U;
-            const yTop = y * voxelSize + voxelSize;
+        function addWaterTopQuad(positions, colors, uvs, x0, x1, z0, z1, y, fillRatio) {
+            const yTop = y * voxelSize + voxelSize * fillRatio;
             const wx0 = (cx * chunkSize + x0) * voxelSize;
             const wx1 = (cx * chunkSize + x1) * voxelSize;
             const wz0 = (cz * chunkSize + z0) * voxelSize;
             const wz1 = (cz * chunkSize + z1) * voxelSize;
+            const gx0 = cx * chunkSize + x0;
+            const gx1 = cx * chunkSize + x1;
+            const gz0 = cz * chunkSize + z0;
+            const gz1 = cz * chunkSize + z1;
 
             // Top face (two triangles)
             positions.push(
@@ -523,13 +611,49 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
 
             for (let i = 0; i < 6; i++) colors.push(1, 1, 1);
             uvs.push(
-                u0, 0,
-                u0, 1,
-                u1, 1,
-                u1, 1,
-                u1, 0,
-                u0, 0,
+                gx0, gz0,
+                gx0, gz1,
+                gx1, gz1,
+                gx1, gz1,
+                gx1, gz0,
+                gx0, gz0,
             );
+        }
+
+        function addWaterSideQuad(positions, colors, uvs, wx, wy, wz, voxelSize, dir, fillTopRatio, fillBottomRatio = 0) {
+            const x0 = wx - voxelSize * 0.5;
+            const x1 = wx + voxelSize * 0.5;
+            const z0 = wz - voxelSize * 0.5;
+            const z1 = wz + voxelSize * 0.5;
+            const yBottom = wy - voxelSize * 0.5;
+            const clampedBottom = Math.max(0, Math.min(1, fillBottomRatio));
+            const clampedTop = Math.max(clampedBottom, Math.min(1, fillTopRatio));
+            const yStart = yBottom + voxelSize * clampedBottom;
+            const yTop = yBottom + voxelSize * clampedTop;
+            if (yTop <= yStart + 1e-6) return;
+
+            let quad = null;
+            // 0=right(+X),1=left(-X),4=front(+Z),5=back(-Z)
+            if (dir === 0) quad = [[x1, yStart, z0], [x1, yTop, z0], [x1, yTop, z1], [x1, yStart, z1]];
+            else if (dir === 1) quad = [[x0, yStart, z1], [x0, yTop, z1], [x0, yTop, z0], [x0, yStart, z0]];
+            else if (dir === 4) quad = [[x0, yStart, z1], [x1, yStart, z1], [x1, yTop, z1], [x0, yTop, z1]];
+            else if (dir === 5) quad = [[x1, yStart, z0], [x0, yStart, z0], [x0, yTop, z0], [x1, yTop, z0]];
+            if (!quad) return;
+
+            const tile = ATLAS.WATER;
+            const u0 = tile * ATLAS_TILE_U;
+            const u1 = u0 + ATLAS_TILE_U;
+            const indices = [0, 1, 2, 2, 3, 0];
+            // Keep side texture scale consistent for shallow layers (no vertical squash).
+            // We clip geometry height, but keep full-tile UV span like Minecraft-style water sheets.
+            const uv4 = [[u0, 0], [u1, 0], [u1, 1], [u0, 1]];
+
+            for (let i = 0; i < 6; i++) {
+                const v = quad[indices[i]];
+                positions.push(v[0], v[1], v[2]);
+                colors.push(1, 1, 1);
+                uvs.push(uv4[indices[i]][0], uv4[indices[i]][1]);
+            }
         }
         const directions = [
             [ 1, 0, 0], // right
@@ -555,9 +679,12 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         const opaquePositions = [];
         const opaqueColors = [];
         const opaqueUvs = [];
-        const waterPositions = [];
-        const waterColors = [];
-        const waterUvs = [];
+        const waterTopPositions = [];
+        const waterTopColors = [];
+        const waterTopUvs = [];
+        const waterSidePositions = [];
+        const waterSideColors = [];
+        const waterSideUvs = [];
 
         for (let x = 0; x < chunkSize; x++) {
             for (let y = 0; y < height; y++) {
@@ -579,10 +706,12 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         // Water surface pass (top faces only) with greedy meshing by Y-slice.
         for (let y = 0; y < height; y++) {
             const mask = Array.from({ length: chunkSize }, () => Array(chunkSize).fill(false));
+            const levelMap = Array.from({ length: chunkSize }, () => Array(chunkSize).fill(-1));
             for (let x = 0; x < chunkSize; x++) {
                 for (let z = 0; z < chunkSize; z++) {
                     const t = voxels[x][y][z];
                     if (!isWater(t)) continue;
+                    levelMap[x][z] = waterLevel(t) ?? 0;
                     const above = y + 1 < height
                         ? (voxels[x][y + 1][z] || 0)
                         : getVoxelAt(cx * chunkSize + x, y + 1, cz * chunkSize + z);
@@ -594,15 +723,21 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
             for (let x0 = 0; x0 < chunkSize; x0++) {
                 for (let z0 = 0; z0 < chunkSize; z0++) {
                     if (!mask[x0][z0] || used[x0][z0]) continue;
+                    const levelHere = levelMap[x0][z0];
 
                     let x1 = x0 + 1;
-                    while (x1 < chunkSize && mask[x1][z0] && !used[x1][z0]) x1++;
+                    while (
+                        x1 < chunkSize &&
+                        mask[x1][z0] &&
+                        !used[x1][z0] &&
+                        levelMap[x1][z0] === levelHere
+                    ) x1++;
 
                     let z1 = z0 + 1;
                     let canGrow = true;
                     while (z1 < chunkSize && canGrow) {
                         for (let xx = x0; xx < x1; xx++) {
-                            if (!mask[xx][z1] || used[xx][z1]) {
+                            if (!mask[xx][z1] || used[xx][z1] || levelMap[xx][z1] !== levelHere) {
                                 canGrow = false;
                                 break;
                             }
@@ -613,7 +748,17 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
                     for (let xx = x0; xx < x1; xx++) {
                         for (let zz = z0; zz < z1; zz++) used[xx][zz] = true;
                     }
-                    addWaterTopQuad(waterPositions, waterColors, waterUvs, x0, x1, z0, z1, y);
+                    addWaterTopQuad(
+                        waterTopPositions,
+                        waterTopColors,
+                        waterTopUvs,
+                        x0,
+                        x1,
+                        z0,
+                        z1,
+                        y,
+                        waterFillRatio(BLOCK_IDS.WATER_LEVEL_0 + levelHere)
+                    );
                 }
             }
         }
@@ -625,18 +770,34 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
                     const type = voxels[x][y][z];
                     if (!isWater(type)) continue;
 
-                    const above = y + 1 < height
-                        ? (voxels[x][y + 1][z] || 0)
-                        : getVoxelAt(cx * chunkSize + x, y + 1, cz * chunkSize + z);
-                    if (above === BLOCK_IDS.AIR) continue; // top already emitted by surface pass
-
                     for (const d of [0, 1, 4, 5]) {
                         const neighbor = neighborTypeAt(x, y, z, d);
-                        if (neighbor !== BLOCK_IDS.AIR) continue;
+                        const fillTop = waterFillRatio(type);
+                        let fillBottom = 0;
+                        if (neighbor === BLOCK_IDS.AIR) {
+                            fillBottom = 0;
+                        } else if (isWater(neighbor)) {
+                            const nFill = waterFillRatio(neighbor);
+                            if (nFill >= fillTop - 1e-6) continue; // no exposed side between equal/higher neighbor water
+                            fillBottom = nFill;
+                        } else {
+                            continue;
+                        }
                         const wx = (cx * chunkSize + x) * voxelSize + voxelSize / 2;
                         const wy = y * voxelSize + voxelSize / 2;
                         const wz = (cz * chunkSize + z) * voxelSize + voxelSize / 2;
-                        addFace(waterPositions, waterColors, waterUvs, wx, wy, wz, voxelSize, d, type);
+                        addWaterSideQuad(
+                            waterSidePositions,
+                            waterSideColors,
+                            waterSideUvs,
+                            wx,
+                            wy,
+                            wz,
+                            voxelSize,
+                            d,
+                            fillTop,
+                            fillBottom
+                        );
                     }
                 }
             }
@@ -657,19 +818,32 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         opaqueMesh.castShadow = false;
         group.add(opaqueMesh);
 
-        if (waterPositions.length > 0) {
-            const waterGeo = new THREE.BufferGeometry();
-            waterGeo.setAttribute('position', new THREE.Float32BufferAttribute(waterPositions, 3));
-            waterGeo.setAttribute('color', new THREE.Float32BufferAttribute(waterColors, 3));
-            if (waterUvs.length > 0) waterGeo.setAttribute('uv', new THREE.Float32BufferAttribute(waterUvs, 2));
-            // No vertex normals — MeshBasicMaterial doesn't use them; saves chunk-build CPU.
-            waterGeo.computeBoundingSphere();
+        if (waterTopPositions.length > 0) {
+            const waterTopGeo = new THREE.BufferGeometry();
+            waterTopGeo.setAttribute('position', new THREE.Float32BufferAttribute(waterTopPositions, 3));
+            waterTopGeo.setAttribute('color', new THREE.Float32BufferAttribute(waterTopColors, 3));
+            if (waterTopUvs.length > 0) waterTopGeo.setAttribute('uv', new THREE.Float32BufferAttribute(waterTopUvs, 2));
+            waterTopGeo.computeBoundingSphere();
 
-            const waterMesh = new THREE.Mesh(waterGeo, sharedWaterMaterial);
-            waterMesh.receiveShadow = false;
-            waterMesh.castShadow = false;
-            waterMesh.renderOrder = 1;
-            group.add(waterMesh);
+            const waterTopMesh = new THREE.Mesh(waterTopGeo, sharedWaterTopMaterial);
+            waterTopMesh.receiveShadow = false;
+            waterTopMesh.castShadow = false;
+            waterTopMesh.renderOrder = 1;
+            group.add(waterTopMesh);
+        }
+
+        if (waterSidePositions.length > 0) {
+            const waterSideGeo = new THREE.BufferGeometry();
+            waterSideGeo.setAttribute('position', new THREE.Float32BufferAttribute(waterSidePositions, 3));
+            waterSideGeo.setAttribute('color', new THREE.Float32BufferAttribute(waterSideColors, 3));
+            if (waterSideUvs.length > 0) waterSideGeo.setAttribute('uv', new THREE.Float32BufferAttribute(waterSideUvs, 2));
+            waterSideGeo.computeBoundingSphere();
+
+            const waterSideMesh = new THREE.Mesh(waterSideGeo, sharedWaterSideMaterial);
+            waterSideMesh.receiveShadow = false;
+            waterSideMesh.castShadow = false;
+            waterSideMesh.renderOrder = 1;
+            group.add(waterSideMesh);
         }
 
         return group;
@@ -769,12 +943,8 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         // (player, mobs, item drops) fall when their supporting block is removed.
 
         // rebuild mesh for this chunk
-        const oldMesh = chunks.get(key);
-        if (oldMesh) scene.remove(oldMesh);
-
-        const newMesh = createChunkMesh(voxels, cx, cz);
-        scene.add(newMesh);
-        chunks.set(key, newMesh);
+        rebuildChunkMesh(cx, cz);
+        rebuildNeighborChunksIfBoundary(lx, lz, cx, cz);
         return prev;
     }
 
@@ -803,12 +973,11 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
 
         voxels[lx][vy][lz] = type;
 
-        const oldMesh = chunks.get(key);
-        if (oldMesh) scene.remove(oldMesh);
-
-        const newMesh = createChunkMesh(voxels, cx, cz);
-        scene.add(newMesh);
-        chunks.set(key, newMesh);
+        rebuildChunkMesh(cx, cz);
+        rebuildNeighborChunksIfBoundary(lx, lz, cx, cz);
+        if (isWater(type) && typeof waterPlacementHandler === 'function') {
+            waterPlacementHandler(vx, vy, vz, type);
+        }
 
         return true;
     }
@@ -819,9 +988,9 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
             sharedChunkMaterial.map = tex;
             sharedChunkMaterial.needsUpdate = true;
         }
-        if (sharedWaterMaterial.map !== tex) {
-            sharedWaterMaterial.map = tex;
-            sharedWaterMaterial.needsUpdate = true;
+        if (sharedWaterSideMaterial.map !== tex) {
+            sharedWaterSideMaterial.map = tex;
+            sharedWaterSideMaterial.needsUpdate = true;
         }
     }
     _notifyAtlasReady = applyAtlasToAllChunks;
@@ -849,6 +1018,10 @@ export function createTerrain(scene, voxelSize = 1, chunkSize = 16, height = 32,
         getChunkKey,
         getSurfaceYAt,
         getWalkableSurfaceYAt,
+        setLeafSeason,
+        setWaterPlacementHandler: (fn) => {
+            waterPlacementHandler = (typeof fn === 'function') ? fn : null;
+        },
 
         /** Promise that resolves when the terrain texture atlas has loaded. Wait for this before starting the game so first chunks have textures. */
         getAtlasReadyPromise: () => terrainAtlasReadyPromise,

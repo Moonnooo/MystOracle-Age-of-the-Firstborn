@@ -10,6 +10,7 @@ let fpsSmoothed = 60;
 let chunkOutlinesGroup = null; // THREE.Group for chunk boundary lines when F3 is on
 let _chunkFrustum = null;      // reused for frustum culling of chunk meshes
 let _chunkProjScreenMatrix = null;
+let appliedLeafSeason = null;
 const canvas = document.getElementById('gameCanvas');
 const loadingOverlay = document.getElementById('loadingOverlay');
 const loadingStatusEl = document.getElementById('loadingStatus');
@@ -106,13 +107,16 @@ const terrain = createTerrain(scene, 1, 32, 64, null);
 // Water system runs after terrain generation and post-processes voxel data
 // to place rivers, lakes, oceans, waterfalls, and swamps in a modular way.
 let waterSystem = createWaterSystem(scene, terrain);
+if (terrain && typeof terrain.setWaterPlacementHandler === 'function') {
+    terrain.setWaterPlacementHandler((wx, wy, wz, type) => {
+        if (waterSystem && typeof waterSystem.onWaterPlaced === 'function') {
+            waterSystem.onWaterPlaced(wx, wy, wz, type);
+        }
+    });
+}
 let creativeMode = false;
 if (typeof window !== 'undefined') {
-    window.DEBUG_WATER_LEVEL_OFFSET = window.DEBUG_WATER_LEVEL_OFFSET || 0;
     window.isCreativeMode = () => creativeMode;
-}
-if (typeof window !== 'undefined') {
-    window.DEBUG_WATER_LEVEL_OFFSET = window.DEBUG_WATER_LEVEL_OFFSET || 0;
 }
 // Apply saved render distance from settings (Minecraft-style view distance)
 const savedRenderDistance = parseInt(localStorage.getItem('voxelShooter_renderDistance'), 10);
@@ -297,165 +301,42 @@ const BLOCK_TYPES = {
 // Terrain block breaking state (per-block hit progress)
 const terrainHitProgress = new Map();
 const TERRAIN_PROGRESS_MEMORY_MS = 2500;
+const leafRegrowthQueue = new Map(); // key -> { x, y, z, regrowAtMs }
+const LEAF_REGROWTH_DELAY_MS = 45000;
 
-function makeBlockKey(x, y, z) {
-    return `${x}|${y}|${z}`;
-}
-
-function classifyToolForBlockBreaking(current, getSlotTypeFn) {
-    if (!current) return 'hand';
-    const t = typeof current === 'string' ? current : getSlotTypeFn(current);
-    if (t === 'pickaxe' || t === 'stone_pickaxe') return t;
-    if (t === 'axe' || t === 'stone_axe') return t;
-    if (t === 'spade') return 'spade';
-    return 'other';
-}
-
-function getHitsToBreakBlock(voxelType, toolKind) {
-    // Numeric IDs from terrain / blocksRegistry: 4 = Log, 6 = Planks
-    // 1: Dirt, 2: Stone, 3: Grass, 4: Log, 7: Coal ore, 8: Iron ore,
-    // 9: Sand, 10: Cactus, 11: Gold ore
-    const isStoneLike = voxelType === 2 || voxelType === 7 || voxelType === 8 || voxelType === 11;
-    const isDirtLike = voxelType === 1 || voxelType === 3 || voxelType === 19;
-    const isWoodLike = voxelType === 4;
-    const isSandLike = voxelType === 9;
-    const isCactus = voxelType === 10;
-
-    if (isStoneLike) {
-        // Only pickaxes can break stone/ores.
-        if (toolKind === 'stone_pickaxe') return 2;
-        if (toolKind === 'pickaxe') return 3;
-        return 0; // cannot break with other tools
-    }
-
-    if (isDirtLike) {
-        if (toolKind === 'spade') return 1;                               // spade: fastest on soil
-        if (toolKind === 'pickaxe' || toolKind === 'stone_pickaxe') return 5; // pickaxe: slower than spade
-        if (toolKind === 'axe' || toolKind === 'stone_axe') return 4;
-        if (toolKind === 'hand' || toolKind === 'other') return 6;        // hand: can break, but noticeably slower
-    }
-
-    if (isSandLike) {
-        if (toolKind === 'spade') return 1;                               // spade: best for sand
-        if (toolKind === 'pickaxe' || toolKind === 'stone_pickaxe') return 4; // can break sand, but slower
-        if (toolKind === 'hand' || toolKind === 'other') return 6;        // hand: can break, slower
-    }
-
-    if (isWoodLike) {
-        if (toolKind === 'axe' || toolKind === 'stone_axe') return 2;         // axe: very good on wood
-        if (toolKind === 'pickaxe' || toolKind === 'stone_pickaxe') return 5; // pickaxe: slow on wood
-        if (toolKind === 'spade') return 4;
-        if (toolKind === 'hand' || toolKind === 'other') return 8;            // hand: can break logs, but quite slow
-    }
-
-    if (isCactus) {
-        if (toolKind === 'spade') return 1;
-        if (toolKind === 'axe' || toolKind === 'stone_axe') return 2;
-        if (toolKind === 'pickaxe' || toolKind === 'stone_pickaxe') return 3;
-        if (toolKind === 'hand' || toolKind === 'other') return 4;
-    }
-
-    // Default for other solid blocks: 1 hit with any tool/hand.
-    return 1;
-}
-
-function applyCactusFallAfterBreak(terrain, vx, vy, vz, removedType) {
-    if (removedType !== 10) return; // 10 = Cactus
-    const maxY = terrain.height || 64;
-    let y = vy + 1;
-    const cactusYs = [];
-    while (y < maxY) {
-        const t = terrain.getVoxelAt(vx, y, vz);
-        if (t === 10) {
-            cactusYs.push(y);
-            y++;
-        } else {
-            break;
-        }
-    }
-    if (!cactusYs.length) return;
-    for (const fromY of cactusYs) {
-        const toY = fromY - 1;
-        terrain.setVoxel(vx, fromY, vz, 0);
-        terrain.setVoxel(vx, toY, vz, 10);
-    }
-}
-
-const LOG_BLOCK_ID = 4;
-const LEAVES_BLOCK_ID_TREE = 5;
-
-/** When a log or leaf block is broken, clear the entire connected tree (logs + leaves) into item entities. */
-function applyTreeColumnCollapse(terrain, vx, vy, vz, removedType) {
-    if (removedType !== LOG_BLOCK_ID && removedType !== LEAVES_BLOCK_ID_TREE) return;
-    if (!itemDropSystem || !particleSystem) return;
-
-    const downDir = new THREE.Vector3(0, -1, 0);
-    const visited = new Set();
-    const queue = [];
-
-    function enqueue(x, y, z) {
-        const key = `${x}|${y}|${z}`;
-        if (visited.has(key)) return;
-        const t = terrain.getVoxelAt(x, y, z);
-        if (t !== LOG_BLOCK_ID && t !== LEAVES_BLOCK_ID_TREE) return;
-        visited.add(key);
-        terrain.setVoxel(x, y, z, 0);
-        queue.push({ x, y, z, type: t });
-    }
-
-    // Seed BFS from the broken block's immediate neighborhood (including itself)
-    enqueue(vx, vy, vz);
-    const seeds = [
-        [vx + 1, vy, vz],
-        [vx - 1, vy, vz],
-        [vx, vy, vz + 1],
-        [vx, vy, vz - 1],
-        [vx, vy + 1, vz],
-        [vx, vy - 1, vz],
-    ];
-    for (const [sx, sy, sz] of seeds) {
-        enqueue(sx, sy, sz);
-    }
-
-    while (queue.length > 0) {
-        const { x, y, z, type } = queue.shift();
-        const origin = new THREE.Vector3(x + 0.5, y + 0.5, z + 0.5);
-        const color = BLOCK_TYPES[type] && BLOCK_TYPES[type].color
-            ? BLOCK_TYPES[type].color
-            : [0.5, 0.5, 0.5];
-        particleSystem.spawn(origin, downDir, null, color);
-
-        const basePos = origin.clone();
-        const randOffset = () => new THREE.Vector3((Math.random() - 0.5) * 0.4, 0.3, (Math.random() - 0.5) * 0.4);
-        if (type === LOG_BLOCK_ID) {
-            itemDropSystem.spawnDrop('wood', 1, basePos.clone().add(randOffset()));
-        } else if (type === LEAVES_BLOCK_ID_TREE) {
-            itemDropSystem.spawnDrop('leaves', 1, basePos.clone().add(randOffset()));
-            // Chance for extra sticks from canopy decay
-            if (Math.random() < 0.5) {
-                const sticks = 1 + Math.floor(Math.random() * 2);
-                for (let i = 0; i < sticks; i++) {
-                    itemDropSystem.spawnDrop('stick', 1, basePos.clone().add(randOffset()));
-                }
-            }
-            // Occasional extra saplings from upper leaves
-            if (Math.random() < 0.25) {
-                itemDropSystem.spawnDrop('sapling', 1, basePos.clone().add(randOffset()));
-            }
-        }
-
-        // Explore 26-connected neighbors (faces, edges, corners) so corner leaves
-        // that only touch diagonally are also included in the cascade.
-        for (let dx = -1; dx <= 1; dx++) {
-            for (let dy = -1; dy <= 1; dy++) {
-                for (let dz = -1; dz <= 1; dz++) {
-                    if (dx === 0 && dy === 0 && dz === 0) continue;
-                    enqueue(x + dx, y + dy, z + dz);
-                }
+function hasNearbyTreeTrunk(x, y, z) {
+    // If no trunk nearby, this was likely part of a removed tree and should not regrow.
+    for (let dx = -3; dx <= 3; dx++) {
+        for (let dz = -3; dz <= 3; dz++) {
+            for (let dy = -5; dy <= 5; dy++) {
+                const t = terrain.getVoxelAt(x + dx, y + dy, z + dz);
+                if (t === BLOCK_IDS.LOG) return true;
             }
         }
     }
+    return false;
 }
+
+function scheduleLeafRegrowth(vx, vy, vz) {
+    if (!hasNearbyTreeTrunk(vx, vy, vz)) return;
+    const key = makeBlockKey(vx, vy, vz);
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    leafRegrowthQueue.set(key, { x: vx, y: vy, z: vz, regrowAtMs: now + LEAF_REGROWTH_DELAY_MS });
+}
+
+function processLeafRegrowth() {
+    if (leafRegrowthQueue.size === 0) return;
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    for (const [key, entry] of leafRegrowthQueue.entries()) {
+        if (now < entry.regrowAtMs) continue;
+        leafRegrowthQueue.delete(key);
+        const cur = terrain.getVoxelAt(entry.x, entry.y, entry.z);
+        if (cur !== BLOCK_IDS.AIR) continue;
+        if (!hasNearbyTreeTrunk(entry.x, entry.y, entry.z)) continue;
+        terrain.setVoxel(entry.x, entry.y, entry.z, BLOCK_IDS.LEAVES);
+    }
+}
+
 
 // Fuel burn time in seconds (for campfire and furnace)
 const FUEL_BURN_TIME = {
@@ -753,6 +634,7 @@ import { loadModels } from './assets/models.js';
 import { loadAllTextures } from './assets/textures.js';
 import { checkCollision } from './utils/collision.js';
 import { BLOCK_IDS, isWater } from './world/blocksRegistry.js';
+import { LOG_BLOCK_ID, LEAVES_BLOCK_ID_TREE, makeBlockKey, classifyToolForBlockBreaking, getHitsToBreakBlock, applyCactusFallAfterBreak, applyTreeColumnCollapse } from './world/blockBreaking.js';
 import { createChestSystem, CHEST_SLOTS } from './systems/chest.js';
 import { createCampfireSystem } from './systems/campfire.js';
 import { createFurnaceSystem } from './systems/furnace.js';
@@ -2754,19 +2636,21 @@ const sky = createSky(scene, camera, undefined, lighting);
 
 const weatherEffects = createWeatherEffects(scene, (target) => camera.getWorldPosition(target), updateDistanceFog);
 
-devConsoleApi = createDevConsole({
-    scene,
-    player,
-    sky,
-    terrain,
-    mobSystem,
-    weatherEffects,
-    placePlayerAtSpawn,
-    onOpenChange(v) {
-        devConsoleOpen = !!v;
-        updateCursorForBackpack();
-    },
-});
+if (import.meta.env.DEV) {
+    devConsoleApi = createDevConsole({
+        scene,
+        player,
+        sky,
+        terrain,
+        mobSystem,
+        weatherEffects,
+        placePlayerAtSpawn,
+        onOpenChange(v) {
+            devConsoleOpen = !!v;
+            updateCursorForBackpack();
+        },
+    });
+}
 
 getSkyTimeRef = () => sky.getTime();
 const _camDir = new THREE.Vector3();
@@ -3183,10 +3067,25 @@ canvas.addEventListener('mousedown', (e) => {
         worldNormal.copy(dir).negate();
     }
 
-    const placePoint = hit.point.clone().add(worldNormal.multiplyScalar(0.51));
-    const px = Math.floor(placePoint.x);
-    const py = Math.floor(placePoint.y);
-    const pz = Math.floor(placePoint.z);
+    const hitPoint = hit.point.clone();
+    const placePoint = hitPoint.clone().add(worldNormal.clone().multiplyScalar(0.51));
+    let px = Math.floor(placePoint.x);
+    let py = Math.floor(placePoint.y);
+    let pz = Math.floor(placePoint.z);
+
+    // Water-on-water: upgrade the hit water cell itself instead of placing above it.
+    if (isWater(placeBlockId)) {
+        const hitBlockPoint = hitPoint.clone().add(worldNormal.clone().multiplyScalar(-0.5));
+        const hx = Math.floor(hitBlockPoint.x);
+        const hy = Math.floor(hitBlockPoint.y);
+        const hz = Math.floor(hitBlockPoint.z);
+        const hitType = terrain.getVoxelAt(hx, hy, hz);
+        if (isWater(hitType)) {
+            px = hx;
+            py = hy;
+            pz = hz;
+        }
+    }
 
     const success = terrain.setVoxel(px, py, pz, placeBlockId);
     
@@ -3406,14 +3305,15 @@ setupShooting(
         const isAxe = current === 'axe' || current === 'stone_axe';
         const isPickaxe = current === 'pickaxe' || current === 'stone_pickaxe';
 
-        // If current slot is pickaxe (or stone pickaxe) or axe, allow breaking chests/campfires/furnaces/looms/beds
-        if (isPickaxe || isAxe) {
+        // Tool interactions and terrain breaking share this path.
+        {
             let target = obj;
             while (target && !target.userData.isChest && !target.userData.isCampfire && !target.userData.isFurnace && !target.userData.isLoom && !target.userData.isBed) {
                 target = target.parent;
             }
 
-            if (target && (target.userData.isChest || target.userData.isCampfire || target.userData.isFurnace || target.userData.isLoom || target.userData.isBed)) {
+            // Only axe/pickaxe can break placeables. Hand/spade skip this and continue to terrain blocks.
+            if ((isPickaxe || isAxe) && target && (target.userData.isChest || target.userData.isCampfire || target.userData.isFurnace || target.userData.isLoom || target.userData.isBed)) {
                 let root = target;
                 if (target.userData.isChest && chestSystem) {
                     while (root.parent && !chestSystem.chests.includes(root)) root = root.parent;
@@ -3628,6 +3528,9 @@ setupShooting(
 
                 const removed = terrain.removeVoxel(vx, vy, vz);
                 if (removed) {
+                    if (waterSystem && typeof waterSystem.onTerrainEdited === 'function') {
+                        waterSystem.onTerrainEdited(vx, vy, vz);
+                    }
                     const isTreeBlock = removed === LOG_BLOCK_ID || removed === LEAVES_BLOCK_ID_TREE;
                     if (!isTreeBlock) snapEntitiesToSurfaceInColumn(vx, vy, vz);
                     // Ore decoration meshes are visual-only; if terrain changes, re-evaluate exposed ores.
@@ -3667,6 +3570,7 @@ setupShooting(
                             if (Math.random() < 0.35) {
                                 itemDropSystem.spawnDrop('sapling', 1, center.clone().add(randOffset()));
                             }
+                            scheduleLeafRegrowth(vx, vy, vz);
                         } else {
                             itemDropSystem.spawnDrop(removed, 1, center);
                         }
@@ -3683,7 +3587,16 @@ setupShooting(
                     }
 
                     applyCactusFallAfterBreak(terrain, vx, vy, vz, removed);
-                    applyTreeColumnCollapse(terrain, vx, vy, vz, removed);
+                    applyTreeColumnCollapse({
+                        terrain,
+                        vx,
+                        vy,
+                        vz,
+                        removedType: removed,
+                        itemDropSystem,
+                        particleSystem,
+                        blockTypes: BLOCK_TYPES,
+                    });
                     if (removed === LOG_BLOCK_ID || removed === LEAVES_BLOCK_ID_TREE) {
                         snapEntitiesToSurfaceInColumn(vx, vy, vz);
                     }
@@ -4188,6 +4101,7 @@ function animate() {
     if (waterSystem && typeof waterSystem.update === 'function') {
         waterSystem.update(delta);
     }
+    processLeafRegrowth();
 
     // Frustum culling: only render chunk meshes that are in the camera view (no draw calls for chunks behind/outside view)
     if (terrain.chunks && terrain.chunks.size > 0) {
@@ -4308,6 +4222,11 @@ function animate() {
         if (yearT >= 0.25 && yearT < 0.5) seasonName = 'Summer';
         else if (yearT >= 0.5 && yearT < 0.75) seasonName = 'Autumn';
         else if (yearT >= 0.75) seasonName = 'Winter';
+        const seasonLower = seasonName.toLowerCase();
+        if (appliedLeafSeason !== seasonLower && terrain && typeof terrain.setLeafSeason === 'function') {
+            terrain.setLeafSeason(seasonLower);
+            appliedLeafSeason = seasonLower;
+        }
 
         const px = Math.floor(player.position.x);
         const pz = Math.floor(player.position.z);
@@ -4347,36 +4266,40 @@ function animate() {
 
         if (needsRecalc) {
             const seasonalPhase = Math.cos(yearT * Math.PI * 2);
-            let targetWorldTemp = 10 - seasonalPhase * 10;
+            // Softer seasonal curve: spring/autumn mild, winter cool, summer warm.
+            let targetWorldTemp = 13 - seasonalPhase * 7;
 
             if (biomeInfo) {
-                if (biomeInfo.biome === 'desert') targetWorldTemp += 5;
-                if (biomeInfo.biome === 'swamp') targetWorldTemp += 2;
-                if (biomeInfo.biome === 'ocean') targetWorldTemp -= 2;
-                if (biomeInfo.biome === 'forest') targetWorldTemp -= 0.5;
-                if (biomeInfo.biome === 'mountains') targetWorldTemp -= 4;
+                if (biomeInfo.biome === 'desert') targetWorldTemp += 4;
+                if (biomeInfo.biome === 'swamp') targetWorldTemp += 1.5;
+                if (biomeInfo.biome === 'ocean') targetWorldTemp -= 1;
+                if (biomeInfo.biome === 'forest') targetWorldTemp -= 0.3;
+                if (biomeInfo.biome === 'mountains') targetWorldTemp -= 3;
             }
 
             const elevationAboveSea = groundY - SEA_LEVEL;
             if (elevationAboveSea > 0) {
-                targetWorldTemp -= elevationAboveSea * 0.1;
+                // Stronger high-altitude lapse rate so mountains feel noticeably colder.
+                const baseAltitudeChill = elevationAboveSea * 0.11;
+                const highAlpineBonus = Math.max(0, elevationAboveSea - 24) * 0.09;
+                targetWorldTemp -= (baseAltitudeChill + highAlpineBonus);
             }
 
             // Day/night swing: warmest around mid-afternoon, coldest before dawn.
             const hour = sky.getTime();
             const diurnalPhase = Math.cos(((hour - 15) / 24) * Math.PI * 2);
-            targetWorldTemp += diurnalPhase * 4.5;
+            targetWorldTemp += diurnalPhase * 3.2;
 
-            if (wxMode === 'lightrain') targetWorldTemp -= 1;
-            else if (wxMode === 'rain') targetWorldTemp -= 2;
-            else if (wxMode === 'heavyrain') targetWorldTemp -= 3;
-            else if (wxMode === 'storm') targetWorldTemp -= 4;
-            else if (wxMode === 'snow') targetWorldTemp -= 8;
+            if (wxMode === 'lightrain') targetWorldTemp -= 0.6;
+            else if (wxMode === 'rain') targetWorldTemp -= 1.3;
+            else if (wxMode === 'heavyrain') targetWorldTemp -= 2.1;
+            else if (wxMode === 'storm') targetWorldTemp -= 3.0;
+            else if (wxMode === 'snow') targetWorldTemp -= 5.0;
 
-            targetWorldTemp = Math.max(-30, Math.min(45, targetWorldTemp));
+            targetWorldTemp = Math.max(-20, Math.min(42, targetWorldTemp));
 
-            const comfortTarget = 20;
-            const targetPlayerTemp = targetWorldTemp + (comfortTarget - targetWorldTemp) * 0.2;
+            const comfortTarget = 21;
+            const targetPlayerTemp = targetWorldTemp + (comfortTarget - targetWorldTemp) * 0.32;
 
             cache.biomeKey = biomeKey;
             cache.elevationBand = elevationBand;
@@ -4424,22 +4347,23 @@ function animate() {
             cache.wetness = Math.min(1, cache.wetness + soak * delta);
         }
 
-        const wetChillC = cache.wetness * 14;
+        const wetChillC = cache.wetness * 7.5;
         const worldTempC = cache.worldTemp;
-        const shelterBufferC = sheltered ? 1.8 : 0;
+        const shelterBufferC = sheltered ? 2.4 : 0;
         const displayedPlayerTemp = cache.playerTemp - wetChillC + shelterBufferC;
 
-        const hypoThreshold = 9;
+        const hypoThreshold = 4.5;
         if (!creativeMode && displayedPlayerTemp < hypoThreshold) {
-            const severity = (hypoThreshold - displayedPlayerTemp) / hypoThreshold;
-            const wetMult = 1 + cache.wetness * 1.35;
-            cache.hypothermiaAccumulator += delta * severity * wetMult * 0.22;
+            const coldGap = hypoThreshold - displayedPlayerTemp;
+            const severity = Math.max(0, Math.min(1, coldGap / 10));
+            const wetMult = 1 + cache.wetness * 0.9;
+            cache.hypothermiaAccumulator += delta * severity * wetMult * 0.08;
             if (cache.hypothermiaAccumulator >= 1) {
                 takeDamage(1);
                 cache.hypothermiaAccumulator = 0;
             }
         } else {
-            cache.hypothermiaAccumulator = Math.max(0, cache.hypothermiaAccumulator - delta * 0.6);
+            cache.hypothermiaAccumulator = Math.max(0, cache.hypothermiaAccumulator - delta * 0.85);
         }
 
         updateTemperatureAndSeason({
@@ -4451,22 +4375,6 @@ function animate() {
             underCover: precip && sheltered,
         });
 
-        if (typeof console !== 'undefined') {
-            const nowMs = performance.now();
-            if (!window._tempDebugLastLog || nowMs - window._tempDebugLastLog > 5000) {
-                console.log('[WeatherDebug]', {
-                    biome: biomeKey,
-                    season: seasonName,
-                    weather: wxMode,
-                    wetness: cache.wetness.toFixed(2),
-                    sheltered: precip ? sheltered : null,
-                    worldTempC: worldTempC.toFixed(1),
-                    playerTempC: displayedPlayerTemp.toFixed(1),
-                    position: { x: px, z: pz, groundY },
-                });
-                window._tempDebugLastLog = nowMs;
-            }
-        }
     }
     updateCoords(player);
     const maxHealthNow = getCurrentMaxHealth();

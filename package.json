@@ -1,6 +1,6 @@
 {
   "name": "voxel-shooter",
-  "version": "1.0.271",
+  "version": "1.0.274",
   "type": "commonjs",
   "main": "main.cjs",
   "scripts": {

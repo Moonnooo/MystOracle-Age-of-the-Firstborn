@@ -1,4 +1,5 @@
 // src/assets/models.js
+import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { ASSET_BASE } from './assetBase.js';
 
@@ -35,33 +36,34 @@ function setupModel(name, object, player, camera) {
         object.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
         if (player) player.add(object);
     } else if (name === 'gun') {
-        object.scale.set(0.5, 0.5, 0.5);
-        object.position.set(0.3, -0.3, -0.5);
+        object.scale.set(0.52, 0.52, 0.52);
+        object.position.set(0.28, -0.40, -0.52);
+        object.rotation.set(-0.38, 0.18, 0.08);
         object.visible = false;
         object.userData.heldType = 'gun';
         object.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
         if (camera) camera.add(object);
     } else if (name === 'pickaxe') {
-        object.scale.set(0.5, 0.5, 0.5);
-        object.position.set(0.3, -0.4, -0.4);
-        object.rotation.set(-0.6, 0.2, 0);
+        object.scale.set(0.52, 0.52, 0.52);
+        object.position.set(0.30, -0.46, -0.50);
+        object.rotation.set(-0.92, 0.26, 0.12);
         object.visible = false;
         object.userData.heldType = 'pickaxe';
         object.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
         if (camera) camera.add(object);
     } else if (name === 'bow') {
         // Bow weapon model attached to camera; arrows are fired by logic in renderer.
-        object.scale.set(0.55, 0.55, 0.55);
-        object.position.set(0.28, -0.45, -0.48);
-        object.rotation.set(-0.25, 0.2, 0);
+        object.scale.set(0.52, 0.52, 0.52);
+        object.position.set(0.29, -0.43, -0.53);
+        object.rotation.set(-0.44, 0.14, Math.PI);
         object.visible = false;
         object.userData.heldType = 'bow';
         object.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
         if (camera) camera.add(object);
     } else if (name === 'axe') {
-        object.scale.set(0.7, 0.7, 0.7);
-        object.position.set(0.35, -0.4, -0.5);
-        object.rotation.set(-0.5, 0.2, 0);
+        object.scale.set(0.52, 0.52, 0.52);
+        object.position.set(0.30, -0.46, -0.50);
+        object.rotation.set(-0.88, 0.24, 0.10);
         object.visible = false;
         object.userData.heldType = 'axe';
         object.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
@@ -115,12 +117,30 @@ function setupModel(name, object, player, camera) {
         if (camera) camera.add(object);
     } else if (name === 'spade') {
         // Tool overlay attached to the camera (like pickaxe).
-        object.scale.set(0.45, 0.45, 0.45);
-        object.position.set(0.25, -0.45, -0.45);
-        object.rotation.set(-0.15, 0.2, 0);
+        // Mirror on local Y so handle/blade swap without orbiting the held pose.
+        object.scale.set(0.52, -0.52, 0.52);
+        // Recenter local pivot so flips rotate the shovel itself in place
+        // instead of orbiting around an offset import origin.
+        object.position.set(0, 0, 0);
+        object.rotation.set(0, 0, 0);
+        object.updateMatrixWorld(true);
+        const bbox = new THREE.Box3().setFromObject(object);
+        const center = new THREE.Vector3();
+        bbox.getCenter(center);
+        object.position.sub(center);
+        // Keep the same held spot in view.
+        object.position.add(new THREE.Vector3(0.31, -0.38, -0.46));
+        // Keep the "180 feels right" held pose, but with mirrored model direction.
+        object.rotation.set(-0.84, 0.24 + Math.PI, 0.08);
         object.visible = false;
         object.userData.heldType = 'spade';
-        object.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+        object.traverse((c) => {
+            if (c.isMesh) {
+                c.castShadow = true;
+                c.receiveShadow = true;
+                if (c.material) c.material.side = THREE.DoubleSide;
+            }
+        });
         if (camera) camera.add(object);
     } else if (name === 'food') {
         object.scale.set(0.35, 0.35, 0.35);

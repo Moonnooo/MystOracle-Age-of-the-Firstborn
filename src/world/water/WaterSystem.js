@@ -30,10 +30,12 @@ export function createWaterSystem(scene, terrain) {
     const waterQueueSet = new Set(); // dedupe by pos key
     const pendingEdits = new Map(); // chunkKey -> Map(posKey -> levelNum)
     const dirtyChunks = new Set(); // chunkKey
+    const manualSourceSet = new Set(); // posKey of manually placed level-0 sources
 
     const INITIAL_SIM_OPS = 30000;
-    const SIM_OPS_PER_UPDATE = 1200;
-    let lastWaterDebugLogMs = 0;
+    // Lower per-frame sim budget so placed water visually propagates over time
+    // instead of filling a whole basin in one instant burst.
+    const SIM_OPS_PER_UPDATE = 12;
 
     function makePosKey(wx, wy, wz) {
         return `${wx},${wy},${wz}`;
@@ -58,11 +60,44 @@ export function createWaterSystem(scene, terrain) {
         waterQueue.push({ x: wx, y: wy, z: wz, key });
     }
 
+    function countAdjacentLevel0(wx, wy, wz) {
+        const dirs6 = [
+            [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0],
+        ];
+        let count = 0;
+        for (const [dx, dy, dz] of dirs6) {
+            const ny = wy + dy;
+            if (ny < 0 || ny >= height) continue;
+            const t = terrain.getVoxelAt(wx + dx, ny, wz + dz) || 0;
+            if (isWater(t) && waterLevel(t) === 0) count++;
+        }
+        return count;
+    }
+
+    function isValidSource(wx, wy, wz) {
+        const key = makePosKey(wx, wy, wz);
+        if (manualSourceSet.has(key)) return true;
+        // Falling column support: if water is directly above, this cell should stay full-height.
+        // This preserves Minecraft-like full vertical sheets over drops.
+        const aboveY = wy + 1;
+        if (aboveY >= 0 && aboveY < height) {
+            const above = terrain.getVoxelAt(wx, aboveY, wz) || 0;
+            if (isWater(above)) return true;
+        }
+        return countAdjacentLevel0(wx, wy, wz) >= 2;
+    }
+
     // Sets water only into AIR (0) or existing water.
     // levelNum is 0..6, where 0 = strong/source.
     function trySetWaterLevel(wx, wy, wz, levelNum) {
         if (levelNum < 0 || levelNum > MAX_WATER_LEVEL) return false;
         if (wy < 0 || wy >= height) return false;
+        let targetLevel = levelNum;
+
+        // Level 0 is only valid for manual sources or infinite-source rule.
+        if (targetLevel === 0 && !isValidSource(wx, wy, wz)) {
+            targetLevel = 1;
+        }
 
         const { chunkKey, lx, lz } = worldToChunkLocal(wx, wz);
         const voxels = voxelData.get(chunkKey);
@@ -76,7 +111,7 @@ export function createWaterSystem(scene, terrain) {
             const posKey = makePosKey(wx, wy, wz);
             const prev = chunkEdits.get(posKey);
             // Stronger water means smaller level number.
-            if (prev == null || levelNum < prev) chunkEdits.set(posKey, levelNum);
+            if (prev == null || targetLevel < prev) chunkEdits.set(posKey, targetLevel);
             return false;
         }
 
@@ -86,9 +121,9 @@ export function createWaterSystem(scene, terrain) {
         if (cur !== 0 && !isWater(cur)) return false;
 
         const curLevel = isWater(cur) ? waterLevel(cur) : null; // 0..6
-        if (curLevel != null && curLevel <= levelNum) return false; // already stronger/equal
+        if (curLevel != null && curLevel <= targetLevel) return false; // already stronger/equal
 
-        voxels[lx][wy][lz] = WATER0 + levelNum;
+        voxels[lx][wy][lz] = WATER0 + targetLevel;
         dirtyChunks.add(chunkKey);
         enqueue(wx, wy, wz);
         return true;
@@ -149,8 +184,6 @@ export function createWaterSystem(scene, terrain) {
         if (!voxels) return;
 
         let changed = false;
-        const debugUnsupported = typeof window !== 'undefined' && window.DEBUG_WATER_UNSUPPORTED_SCAN;
-        let removedUnsupported = 0;
 
         for (let lx = 0; lx < chunkSize; lx++) {
             for (let lz = 0; lz < chunkSize; lz++) {
@@ -177,17 +210,12 @@ export function createWaterSystem(scene, terrain) {
                     if (!supported) {
                         voxels[lx][y][lz] = 0;
                         changed = true;
-                        if (debugUnsupported) removedUnsupported++;
                     }
                 }
             }
         }
 
         if (changed) dirtyChunks.add(chunkKey);
-
-        if (debugUnsupported && changed) {
-            console.log(`[WaterDebug] cleanup removed unsupported water at chunk ${cx},${cz}: ${removedUnsupported}`);
-        }
     }
 
     function stepSimulation(maxOps) {
@@ -223,7 +251,8 @@ export function createWaterSystem(scene, terrain) {
             if (belowY >= 0) {
                 const below = voxels[lx][belowY][lz] || 0;
                 if (below === 0) {
-                    trySetWaterLevel(pos.x, belowY, pos.z, 0);
+                    // Falling water keeps same strength; it does not become a source.
+                    trySetWaterLevel(pos.x, belowY, pos.z, curLevel);
                     ops++;
                     continue;
                 }
@@ -235,11 +264,8 @@ export function createWaterSystem(scene, terrain) {
                 for (const [dx, dz] of dirs4) {
                     const nwx = pos.x + dx;
                     const nwz = pos.z + dz;
-                    // Above the global sea plane, never flow sideways. River/lake seeds at high Y were
-                    // smearing across every adjacent air block at the same height (whole hilltops).
-                    if (pos.y > SEA_LEVEL) {
-                        continue;
-                    }
+                    // Allow layered lateral spread at all heights so placed source blocks
+                    // can decay outward naturally (level 0 -> 1 -> ... -> 6).
                     const nBh = computeBaseHeight(nwx, nwz);
                     // Match biomes.js: true ocean columns may share a deep water sheet laterally.
                     const neighborIsOceanBiome = nBh <= SEA_LEVEL - 2;
@@ -247,8 +273,34 @@ export function createWaterSystem(scene, terrain) {
                     if (!neighborIsOceanBiome && nBh < SEA_LEVEL && pos.y > nBh) {
                         continue;
                     }
-                    trySetWaterLevel(nwx, pos.y, nwz, nextLevel);
+                    const targetLevel = nextLevel;
+                    trySetWaterLevel(nwx, pos.y, nwz, targetLevel);
                 }
+            }
+
+            // 3) Decay/removal: disconnected non-source flowing water should disappear.
+            let hasLowerNeighbor = false;
+            let hasFeederNeighbor = false;
+            const dirs6 = [
+                [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0],
+            ];
+            for (const [dx, dy, dz] of dirs6) {
+                const ny = pos.y + dy;
+                if (ny < 0 || ny >= height) continue;
+                const nt = terrain.getVoxelAt(pos.x + dx, ny, pos.z + dz) || 0;
+                if (!isWater(nt)) continue;
+                const nl = waterLevel(nt);
+                if (nl != null && nl <= curLevel) {
+                    hasFeederNeighbor = true;
+                }
+                if (nl != null && nl < curLevel) {
+                    hasLowerNeighbor = true;
+                    break;
+                }
+            }
+            if (!hasLowerNeighbor && !hasFeederNeighbor && !isValidSource(pos.x, pos.y, pos.z)) {
+                voxels[lx][pos.y][lz] = BLOCK_IDS.AIR;
+                dirtyChunks.add(chunkKey);
             }
 
             ops++;
@@ -260,7 +312,7 @@ export function createWaterSystem(scene, terrain) {
         const rebuildY = Math.min(height - 1, Math.max(0, Math.floor(SEA_LEVEL)));
         let rebuilt = 0;
         for (const chunkKey of dirtyChunks) {
-            if (rebuilt >= 8) break;
+            if (rebuilt >= 3) break;
             const parts = String(chunkKey).split(',');
             const cx = parseInt(parts[0], 10);
             const cz = parseInt(parts[1], 10);
@@ -326,10 +378,7 @@ export function createWaterSystem(scene, terrain) {
         // Bring in any cross-chunk writes queued while neighbors were unloaded.
         applyPendingEditsToChunk(cx, cz);
 
-        const debugOffset = typeof window !== 'undefined' && typeof window.DEBUG_WATER_LEVEL_OFFSET === 'number'
-            ? window.DEBUG_WATER_LEVEL_OFFSET
-            : 0;
-        const effectiveSeaLevel = SEA_LEVEL + debugOffset;
+        const effectiveSeaLevel = SEA_LEVEL;
 
         // Prepare lightweight helpers we pass to each module
         const helpers = {
@@ -384,26 +433,6 @@ export function createWaterSystem(scene, terrain) {
 
         applySandSeabedToChunk(voxels);
 
-        if (typeof window !== 'undefined' && window.DEBUG_WATER_SIM) {
-            const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
-            if (now - lastWaterDebugLogMs > 2500) {
-                lastWaterDebugLogMs = now;
-                const counts = Array(MAX_WATER_LEVEL + 1).fill(0);
-                for (let x = 0; x < chunkSize; x++) {
-                    for (let y = 0; y < height; y++) {
-                        for (let z = 0; z < chunkSize; z++) {
-                            const t = voxels[x][y][z] || 0;
-                            if (!isWater(t)) continue;
-                            const lvl = waterLevel(t);
-                            if (lvl == null) continue;
-                            counts[lvl] += 1;
-                        }
-                    }
-                }
-                console.log(`[WaterDebug] chunk ${cx},${cz} queue=${waterQueue.length} waterByLevel=${counts.join(',')}`);
-            }
-        }
-
         // Rebuild any chunk meshes we touched.
         rebuildDirtyChunks();
         dirtyChunks.clear();
@@ -422,10 +451,7 @@ export function createWaterSystem(scene, terrain) {
         // If the IDs are already correct, no work.
         if (oldWaterId === newWaterId) return 0;
 
-        const debugOffset = typeof window !== 'undefined' && typeof window.DEBUG_WATER_LEVEL_OFFSET === 'number'
-            ? window.DEBUG_WATER_LEVEL_OFFSET
-            : 0;
-        const effectiveSeaLevel = SEA_LEVEL + debugOffset;
+        const effectiveSeaLevel = SEA_LEVEL;
 
         let changedChunks = 0;
 
@@ -465,12 +491,45 @@ export function createWaterSystem(scene, terrain) {
         // Currently nothing to clean up; particles/effects are handled elsewhere.
     }
 
+    function onTerrainEdited(wx, wy, wz) {
+        // Wake nearby water so openings made by mining can start flowing.
+        const dirs = [
+            [0, 1, 0], [0, -1, 0],
+            [1, 0, 0], [-1, 0, 0],
+            [0, 0, 1], [0, 0, -1],
+        ];
+        for (const [dx, dy, dz] of dirs) {
+            const nx = wx + dx;
+            const ny = wy + dy;
+            const nz = wz + dz;
+            if (ny < 0 || ny >= height) continue;
+            const t = terrain.getVoxelAt(nx, ny, nz) || 0;
+            if (!isWater(t)) continue;
+            enqueue(nx, ny, nz);
+        }
+    }
+
+    function onWaterPlaced(wx, wy, wz, type) {
+        if (!isWater(type)) return;
+        const lvl = waterLevel(type);
+        if (lvl == null) return;
+        if (lvl === 0) {
+            manualSourceSet.add(makePosKey(wx, wy, wz));
+        }
+        // Seed simulation from this position immediately.
+        enqueue(wx, wy, wz);
+        // Ensure the placed voxel is represented at the intended strength.
+        trySetWaterLevel(wx, wy, wz, lvl);
+    }
+
     // Do it once at startup for already-generated chunks.
     remapLegacyWaterId11ToCurrentWater();
 
     return {
         onChunkGenerated,
         onChunkUnload,
+        onTerrainEdited,
+        onWaterPlaced,
         update(_delta) {
             if (waterQueue.length === 0) return;
             stepSimulation(SIM_OPS_PER_UPDATE);

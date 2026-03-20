@@ -2,21 +2,30 @@ import * as THREE from 'three';
 
 function fillBoltPositions(out, segments, topY, bottomY, minRadiusXZ, maxRadiusXZ, jitter) {
     out.length = 0;
+    const seg = Math.max(1, Math.floor(Number(segments) || 1));
+    const top = Number.isFinite(topY) ? topY : 80;
+    const bottom = Number.isFinite(bottomY) ? bottomY : 12;
+    const minR = Number.isFinite(minRadiusXZ) ? minRadiusXZ : 120;
+    const maxR = Number.isFinite(maxRadiusXZ) ? maxRadiusXZ : 280;
+    const loR = Math.min(minR, maxR);
+    const hiR = Math.max(minR, maxR);
+    const jit = Number.isFinite(jitter) ? jitter : 5.5;
+
     const angle = Math.random() * Math.PI * 2;
-    const radius = minRadiusXZ + Math.random() * Math.max(0, maxRadiusXZ - minRadiusXZ);
+    const radius = loR + Math.random() * Math.max(0, hiR - loR);
     const ox = Math.cos(angle) * radius;
     const oz = Math.sin(angle) * radius;
 
     // Slightly move the lower end so it looks like a bolt bends.
-    const bend = radius * 0.22 + jitter * 0.35;
+    const bend = radius * 0.22 + jit * 0.35;
     const bx = ox + (Math.random() - 0.5) * bend;
     const bz = oz + (Math.random() - 0.5) * bend;
-    for (let i = 0; i <= segments; i++) {
-        const t = i / segments;
+    for (let i = 0; i <= seg; i++) {
+        const t = i / seg;
         const falloff = 1 - t * 0.85;
-        const x = THREE.MathUtils.lerp(ox, bx, t) + (Math.random() - 0.5) * jitter * falloff;
-        const y = THREE.MathUtils.lerp(topY, bottomY, t);
-        const z = THREE.MathUtils.lerp(oz, bz, t) + (Math.random() - 0.5) * jitter * falloff;
+        const x = THREE.MathUtils.lerp(ox, bx, t) + (Math.random() - 0.5) * jit * falloff;
+        const y = THREE.MathUtils.lerp(top, bottom, t);
+        const z = THREE.MathUtils.lerp(oz, bz, t) + (Math.random() - 0.5) * jit * falloff;
         out.push(x, y, z);
     }
 }
@@ -392,9 +401,10 @@ export function createWeatherEffects(scene, getCameraWorldPosition, restoreDista
                     _mainBoltFlat,
                     13 + Math.floor(Math.random() * 5),
                     82 + Math.random() * 8,
+                    10 + Math.random() * 8,
                     120,
                     280,
-                    5.5,
+                    5.5
                 );
                 applyLinePositions(boltMain, _mainBoltFlat);
                 applyLinePositions(boltGlow, _mainBoltFlat);
