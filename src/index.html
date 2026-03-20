@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MystOracle: Age of the Firstborn</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Secure Content Security Policy -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' blob:; object-src 'none';">
+</head>
+<body>
+    <!-- Game canvas -->
+    <canvas id="gameCanvas" tabindex="0"></canvas>
+
+    <!-- Initial loading screen (shown until terrain + player spawn are ready) -->
+    <div id="loadingOverlay">
+        <div class="loading-panel">
+            <div class="loading-title">MystOracle: Age of the Firstborn</div>
+            <div id="loadingStatus" class="loading-status">Initializing renderer…</div>
+            <div class="loading-bar">
+                <div id="loadingBarFill" class="loading-bar-fill"></div>
+            </div>
+            <div class="loading-hint">Please wait while the world is generated and your spawn point is prepared.</div>
+        </div>
+    </div>
+
+    <!-- WebGL lost/blocked overlay (shown when GPU context is lost or blocked) -->
+    <div id="webglLostOverlay" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.9); z-index: 99999; align-items: center; justify-content: center; flex-direction: column; padding: 24px; text-align: center;">
+        <p style="font-size: 1.25rem; margin-bottom: 12px;">WebGL is unavailable</p>
+        <p style="color: #aaa; max-width: 360px; margin-bottom: 20px;">The game’s graphics context was lost or blocked (e.g. after a crash or out-of-memory). Please refresh the page or restart the app to play again.</p>
+        <button type="button" onclick="location.reload()" class="pause-menu-btn">Refresh page</button>
+    </div>
+
+    <!-- UI overlays (pointer hint hidden — app locks pointer automatically when focused) -->
+    <div id="crosshair"></div>
+    <div id="pointerHint" style="display: none;">Click to play</div>
+
+    <div id="topLeftHud">
+        <div id="compassOverlay"></div>
+        <div id="clockOverlay"></div>
+        <div id="dayCounter"></div>
+        <div id="coordsDisplay"></div>
+    </div>
+
+    <div id="healthBar"></div>
+    <div id="pauseOverlay" style="display: none;">
+        <div style="font-size: 64px; font-weight: 700; margin-bottom: 30px; text-shadow: 0 0 20px rgba(255, 255, 255, 0.5), 2px 2px 8px rgba(0, 0, 0, 0.8);">PAUSED</div>
+        <button id="resumeButton" class="pause-menu-btn">Resume</button>
+        <button id="settingsButton" class="pause-menu-btn">Settings</button>
+        <button id="saveLoadButton" class="pause-menu-btn">Save / Load</button>
+        <button id="newWorldButton" class="pause-menu-btn">New World</button>
+        <button id="exitButton" class="pause-menu-btn pause-menu-btn-exit">Exit Game</button>
+    </div>
+
+    <div id="saveLoadOverlay" style="display: none;">
+        <div class="settings-panel save-load-panel">
+            <h2>Save / Load</h2>
+            <div class="save-load-title">Choose a slot to save, load, or delete.</div>
+            <div id="saveLoadSlots" class="save-load-slots"></div>
+            <button id="saveLoadBackButton" class="pause-menu-btn">Back</button>
+        </div>
+    </div>
+
+    <div id="settingsOverlay" style="display: none;">
+        <div class="settings-panel">
+            <h2>Settings</h2>
+            <div class="settings-row">
+                <label for="renderDistanceInput">Render distance (chunks)</label>
+                <div class="settings-row-controls">
+                    <input type="range" id="renderDistanceInput" min="1" max="16" value="2" step="1">
+                    <span id="renderDistanceValue">2</span>
+                </div>
+                <p class="settings-hint">Max 16 to avoid GPU out-of-memory; lower is better for performance.</p>
+            </div>
+            <div class="settings-row">
+                <label for="gameVolumeInput">Game volume</label>
+                <div class="settings-row-controls">
+                    <input type="range" id="gameVolumeInput" min="0" max="100" value="100" step="1">
+                    <span id="gameVolumeValue">100%</span>
+                </div>
+            </div>
+            <div class="settings-row">
+                <label class="settings-checkbox-label">
+                    <input type="checkbox" id="gameMuteCheckbox">
+                    <span>Mute game sounds</span>
+                </label>
+            </div>
+            <button id="settingsBackButton" class="pause-menu-btn">Back</button>
+        </div>
+    </div>
+
+    <div id="referenceOverlay" style="display: none;">
+        <div class="reference-panel">
+            <h2>Reference</h2>
+            <p class="reference-intro">MystOracle: Age of the Firstborn — mine blocks, fight mobs, use chests and campfires.</p>
+            <h3>Controls</h3>
+            <ul>
+                <li><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> — Move</li>
+                <li>Mouse — Look around</li>
+                <li>Click — Lock pointer / Shoot or mine (depends on hotbar)</li>
+                <li><kbd>E</kbd> — Open / close backpack</li>
+                <li><kbd>C</kbd> — Open / close crafting (shows backpack)</li>
+                <li><kbd>F</kbd> — Interact (open chest, use campfire when looking at one)</li>
+                <li><kbd>1</kbd>–<kbd>9</kbd> — Select hotbar slot</li>
+                <li>Mouse wheel — Change hotbar slot</li>
+                <li><kbd>Esc</kbd> — Pause / close UIs</li>
+                <li><kbd>F1</kbd> — This reference (toggle)</li>
+                <li><kbd>F3</kbd> — Performance (FPS, chunks, render distance, chunk outlines)</li>
+            </ul>
+            <p class="reference-hint">Press <kbd>F1</kbd> or <kbd>Esc</kbd> to close.</p>
+        </div>
+    </div>
+
+    <div id="performanceOverlay" style="display: none;">
+        <div class="performance-panel">
+            <h3>Performance</h3>
+            <div id="perfFps">FPS: —</div>
+            <div id="perfChunks">Chunks loaded: —</div>
+            <div id="perfRenderDist">Render distance: —</div>
+            <div id="perfEntities">Entities: —</div>
+            <div id="perfMobs">Mobs: —</div>
+            <p class="performance-hint">Press <kbd>F3</kbd> to close. Chunk outlines shown while open.</p>
+        </div>
+    </div>
+
+    <!-- Renderer as ES module -->
+    <script type="module" src="./renderer.js"></script>
+</body>
+</html>
